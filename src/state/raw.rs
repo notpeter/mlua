@@ -1282,6 +1282,8 @@ impl RawLua {
                     push_table(state, 0, methods_nrec, true)?;
                 }
             }
+            // The index is used only by Luau to retain callback owners.
+            #[cfg_attr(not(feature = "luau"), allow(clippy::unused_enumerate_index))]
             for (_i, (k, m)) in registry.methods.into_iter().enumerate() {
                 self.push(self.create_callback(m)?)?;
                 #[cfg(feature = "luau")]
