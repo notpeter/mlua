@@ -288,7 +288,7 @@ impl JitOptions {
 
     /// Toggles the runtime bytecode inliner.
     ///
-    /// Disabled by default. Changing this option does not affect already loaded functions.
+    /// Disabled by default. Enable before compiling and executing code.
     #[must_use]
     pub const fn inliner(mut self, enabled: bool) -> Self {
         self.inliner = enabled;
@@ -979,6 +979,8 @@ impl Lua {
     }
 
     /// Sets the warning function to be used by Lua to emit warnings.
+    ///
+    /// Errors returned by the callback are ignored. A panic in the callback aborts the process.
     #[cfg(any(feature = "lua55", feature = "lua54"))]
     #[cfg_attr(docsrs, doc(cfg(any(feature = "lua55", feature = "lua54"))))]
     pub fn set_warning_function<F>(&self, callback: F)
@@ -987,18 +989,21 @@ impl Lua {
     {
         use std::ffi::CStr;
         use std::os::raw::{c_char, c_void};
+        use std::panic::{AssertUnwindSafe, catch_unwind};
 
         unsafe extern "C-unwind" fn warn_proc(ud: *mut c_void, msg: *const c_char, tocont: c_int) {
             let extra = ud as *mut ExtraData;
-            callback_error_ext((*extra).raw_lua().state(), extra, false, |extra, _| {
+            // The hook has no lua_State, so it cannot safely raise an error in the calling thread.
+            catch_unwind(AssertUnwindSafe(|| {
                 let warn_callback = (*extra).warn_callback.clone();
                 let warn_callback = mlua_expect!(warn_callback, "no warning callback set in warn_proc");
                 if XRc::strong_count(&warn_callback) > 2 {
-                    return Ok(());
+                    return;
                 }
                 let msg = String::from_utf8_lossy(CStr::from_ptr(msg).to_bytes());
-                warn_callback((*extra).lua(), &msg, tocont != 0)
-            });
+                let _ = warn_callback((*extra).lua(), &msg, tocont != 0);
+            }))
+            .unwrap_or_else(|_| std::process::abort());
         }
 
         let lua = self.lock();
@@ -1325,8 +1330,6 @@ impl Lua {
         unsafe {
             let state = lua.main_state();
             if options.inliner {
-                let _ = Self::set_fflag("LuauCallFeedback", true);
-                let _ = Self::set_fflag("LuauEmitCallFeedback", true);
                 ffi::luau_enable_jit_inliner(state);
             } else {
                 ffi::luau_disable_jit_inliner(state);
@@ -1336,11 +1339,16 @@ impl Lua {
 
     /// Sets Luau feature flag (global setting).
     ///
+    /// Flags must be configured before creating any Lua VMs or compiling any Luau code.
+    /// This function must not run concurrently with any other Luau operation, including itself.
+    /// Changing flags later can cause data races or invalidate compiled bytecode.
+    ///
     /// See https://github.com/luau-lang/luau/blob/master/CONTRIBUTING.md#feature-flags for details.
     #[cfg(feature = "luau")]
     #[doc(hidden)]
     #[allow(clippy::result_unit_err)]
     pub fn set_fflag(name: &str, enabled: bool) -> StdResult<(), ()> {
+        // TODO: Make this function unsafe in the next breaking release.
         if let Ok(name) = std::ffi::CString::new(name)
             && unsafe { ffi::luau_setfflag(name.as_ptr(), enabled as c_int) != 0 }
         {
@@ -1672,6 +1680,7 @@ impl Lua {
     /// Registers a custom Rust type in Lua to use in userdata objects.
     ///
     /// This methods provides a way to add fields or methods to userdata objects of a type `T`.
+    /// Re-registering a type invalidates existing userdata instances of that type.
     pub fn register_userdata_type<T: 'static>(&self, f: impl FnOnce(&mut UserDataRegistry<T>)) -> Result<()> {
         let type_id = TypeId::of::<T>();
         let mut registry = UserDataRegistry::new(self);
@@ -1679,9 +1688,16 @@ impl Lua {
 
         let lua = self.lock();
         unsafe {
-            // Deregister the type if it already registered
+            let state = lua.state();
+            let _sg = StackGuard::new(state);
+            check_stack(state, 1)?;
+
+            // Deregister the old metatable before releasing its registry reference.
             if let Some(table_id) = (*lua.extra.get()).registered_userdata_t.remove(&type_id) {
-                ffi::luaL_unref(lua.state(), ffi::LUA_REGISTRYINDEX, table_id);
+                ffi::lua_rawgeti(state, ffi::LUA_REGISTRYINDEX, table_id as _);
+                lua.deregister_userdata_metatable(ffi::lua_topointer(state, -1));
+                ffi::lua_pop(state, 1);
+                ffi::luaL_unref(state, ffi::LUA_REGISTRYINDEX, table_id);
             }
 
             // Add to "pending" registration map

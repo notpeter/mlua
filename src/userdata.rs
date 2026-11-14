@@ -11,7 +11,7 @@ use std::os::raw::{c_char, c_void};
 use crate::Either;
 use crate::error::{Error, Result};
 use crate::function::Function;
-use crate::state::Lua;
+use crate::state::{Lua, WeakLua};
 use crate::string::LuaString;
 use crate::table::{Table, TablePairs};
 use crate::traits::{FromLua, FromLuaMulti, IntoLua, IntoLuaMulti};
@@ -816,6 +816,9 @@ impl AnyUserData {
     /// This is similar to [`AnyUserData::take`], but it doesn't require a type.
     ///
     /// This method works for non-scoped userdata only.
+    ///
+    /// Panics from the value's destructor propagate to the caller. During garbage collection,
+    /// destructor panics abort the process instead.
     pub fn destroy(&self) -> Result<()> {
         let lua = self.0.lua.lock();
         let state = lua.state();
@@ -825,7 +828,12 @@ impl AnyUserData {
 
             lua.push_userdata_ref(&self.0)?;
             protect_lua!(state, 1, 1, fn(state) {
-                if ffi::luaL_callmeta(state, -1, cstr!("__gc")) == 0 {
+                if ffi::luaL_getmetafield(state, 1, cstr!("__gc")) != ffi::LUA_TNIL {
+                    ffi::lua_pushvalue(state, 1);
+                    // Only explicit destruction may propagate panics
+                    ffi::lua_pushboolean(state, 1);
+                    ffi::lua_call(state, 2, 1);
+                } else {
                     ffi::lua_pushboolean(state, 0);
                 }
             })?;
@@ -1018,6 +1026,13 @@ impl AnyUserData {
     #[inline]
     pub fn to_pointer(&self) -> *const c_void {
         self.0.to_pointer()
+    }
+
+    /// Returns a weak reference to the Lua instance owning this value.
+    #[doc(hidden)]
+    #[inline]
+    pub fn weak_lua(&self) -> &WeakLua {
+        &self.0.lua
     }
 
     /// Returns [`TypeId`] of this userdata if it is registered and `'static`.

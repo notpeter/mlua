@@ -396,6 +396,9 @@ impl Compiler {
     ///
     /// Returns [`Error::SyntaxError`] if the source code is invalid.
     pub fn compile(&self, source: impl AsRef<[u8]>) -> Result<Vec<u8>> {
+        #[cfg(feature = "luau-jit")]
+        crate::luau::init_jit_flags();
+
         use std::cell::RefCell;
         use std::ffi::CStr;
         use std::os::raw::{c_char, c_int};
@@ -672,7 +675,8 @@ impl Chunk<'_> {
                 self.mode = Some(ChunkMode::Binary);
             }
             #[cfg(not(feature = "luau"))]
-            if let Ok(func) = self.lua.lock().load_chunk(None, None, None, source.as_ref())
+            if let Ok(name) = Self::convert_name(self.name.clone())
+                && let Ok(func) = (self.lua.lock()).load_chunk(Some(&name), None, None, source.as_ref())
                 && let Ok(data) = func.try_dump(false)
             {
                 self.source = Ok(Cow::Owned(data));
