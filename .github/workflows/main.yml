@@ -138,6 +138,14 @@ jobs:
             pkg install --accept ooce/developer/rust
           run: |
             export PATH=/opt/ooce/bin:/opt/ooce/sbin:/usr/gnu/bin:/usr/bin:/usr/sbin:/sbin
+            swap -s
+            zpool list
+            zfs create -V 8G rpool/ci-swap
+            swap -a /dev/zvol/dsk/rpool/ci-swap
+            swap -l
+            swap -s
+            export CARGO_BUILD_JOBS=2
+            export RUST_TEST_THREADS=2
             rustc --version
             cargo --version
             cargo test --features "${{ matrix.lua }},vendored"
